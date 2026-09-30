@@ -49,6 +49,20 @@ func (s *Store) SaveSecret(ctx context.Context, record *SecretRecord) error {
 	return writeJSONAtomic(filepath.Join(s.dir, materialsFile), s.Materials, 0o600)
 }
 
+// SaveMaterials replaces the whole material map in one atomic write, which is
+// required to keep key rotation all-or-nothing.
+func (s *Store) SaveMaterials(ctx context.Context, records map[string]*SecretRecord) error {
+	next := make(map[string]*SecretRecord, len(records))
+	for name, record := range records {
+		next[name] = cloneJSON(record)
+	}
+	if err := writeJSONAtomic(filepath.Join(s.dir, materialsFile), next, 0o600); err != nil {
+		return err
+	}
+	s.Materials = next
+	return nil
+}
+
 func (s *Store) SaveLease(ctx context.Context, lease *LeaseRecord) error {
 	s.Leases[lease.TokenHash] = cloneJSON(lease)
 	return writeJSONAtomic(filepath.Join(s.dir, leasesFile), s.Leases, 0o600)
@@ -122,6 +136,16 @@ func (s *Store) loadLeases() error {
 	}
 	if s.Leases == nil {
 		s.Leases = make(map[string]*LeaseRecord)
+	}
+	// Backfill leases written before purpose/scope support so pre-existing
+	// borrows keep their original full-access behavior after upgrade.
+	for _, lease := range s.Leases {
+		if lease.Purpose == "" {
+			lease.Purpose = DefaultPurpose
+		}
+		if len(lease.Scopes) == 0 {
+			lease.Scopes = []string{ScopeMaterialRead, ScopeMetadataView, ScopeAuditRead}
+		}
 	}
 	return nil
 }

@@ -26,20 +26,36 @@ func main() {
 	}
 	defer service.Close()
 
-	version, err := service.CreateSecret(ctx, "payment-sandbox", []byte("fictional-api-key"), localsecretmaterials.SecretOptions{
+	version, err := service.CreateSecret(ctx, "payment-sandbox", []byte("fictional-api-key-v1"), localsecretmaterials.SecretOptions{
 		Rotation: localsecretmaterials.RotationPolicy{
-			OldLeases:   localsecretmaterials.SettleGracePeriod,
-			GracePeriod: time.Minute,
+			OldLeases: localsecretmaterials.SettleBatchEnd,
+			BatchSize: 1,
 		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	lease, err := service.Borrow(ctx, "payment-sandbox", *ttl)
+	lease, err := service.BorrowFor(ctx, "payment-sandbox", localsecretmaterials.BorrowRequest{
+		Purpose: "ops-runbook",
+		Scopes:  []string{localsecretmaterials.ScopeMaterialRead, localsecretmaterials.ScopeMetadataView, localsecretmaterials.ScopeAuditRead},
+		TTL:     *ttl,
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	material, err := service.Use(ctx, lease.Token)
+	material, err := service.UseForPurpose(ctx, lease.Token, "ops-runbook")
+	if err != nil {
+		log.Fatal(err)
+	}
+	newVersion, err := service.RotateSecret(ctx, "payment-sandbox", []byte("fictional-api-key-v2"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ended, err := service.EndOldLeaseBatch(ctx, "payment-sandbox", version, 1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	rotated, err := service.RotateMasterKey(ctx, localsecretmaterials.MustMasterKey(localsecretmaterials.GenerateDemoMasterKey()))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -47,6 +63,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("created %s; checked out %d fictional bytes; lease revoked\n", version, len(material.Plaintext))
-	fmt.Println("the process-local master key was not saved; restart cannot decrypt this version")
+	fmt.Printf("created %s; checked out %d fictional bytes for %q; rotated to %s\n", version, len(material.Plaintext), lease.Purpose, newVersion)
+	fmt.Printf("ended %d old borrow(s); re-sealed %d version(s) with a fresh process key; lease revoked\n", ended, rotated)
+	fmt.Println("no plaintext or reusable token is written to public errors or the audit log")
 }

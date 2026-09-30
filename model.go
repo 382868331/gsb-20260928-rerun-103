@@ -23,6 +23,8 @@ type LeaseRecord struct {
 	TokenHash  string    `json:"token_hash"`
 	SecretName string    `json:"secret_name"`
 	VersionID  string    `json:"version_id"`
+	Purpose    string    `json:"purpose"`
+	Scopes     []string  `json:"scopes,omitempty"`
 	IssuedAt   time.Time `json:"issued_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	RevokedAt  time.Time `json:"revoked_at,omitempty"`
@@ -39,6 +41,8 @@ func (r *LeaseRecord) toLease(token string) *Lease {
 		Token:      token,
 		SecretName: r.SecretName,
 		VersionID:  r.VersionID,
+		Purpose:    r.Purpose,
+		Scopes:     append([]string(nil), r.Scopes...),
 		IssuedAt:   r.IssuedAt,
 		ExpiresAt:  r.ExpiresAt,
 	}
@@ -52,6 +56,7 @@ type AuditEvent struct {
 	Version      string    `json:"version,omitempty"`
 	PriorVersion string    `json:"prior_version,omitempty"`
 	LeaseID      string    `json:"lease_id,omitempty"`
+	Purpose      string    `json:"purpose,omitempty"`
 	KeyID        string    `json:"key_id,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
 }
