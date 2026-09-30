@@ -35,7 +35,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	lease, err := service.Borrow(ctx, "payment-sandbox", *ttl)
+	lease, err := service.Borrow(ctx, "payment-sandbox", *ttl, localsecretmaterials.BorrowOptions{
+		Purpose: "demo checkout",
+		Scopes:  []localsecretmaterials.Scope{localsecretmaterials.ScopeReadMaterial},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

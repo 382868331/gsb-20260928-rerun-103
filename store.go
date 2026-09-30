@@ -50,6 +50,14 @@ func (s *Store) SaveSecret(ctx context.Context, record *SecretRecord) error {
 }
 
 func (s *Store) SaveLease(ctx context.Context, lease *LeaseRecord) error {
+	if existing, ok := s.Leases[lease.TokenHash]; ok && !existing.RevokedAt.IsZero() {
+		if lease.RevokedAt.IsZero() {
+			return fmt.Errorf("%w: cannot restore revoked lease %s", ErrLeaseTerminal, lease.ID)
+		}
+		if lease.RevokedAt.Before(existing.RevokedAt) || lease.ExpiresAt.After(existing.ExpiresAt) {
+			return fmt.Errorf("%w: cannot weaken terminal lease %s", ErrLeaseTerminal, lease.ID)
+		}
+	}
 	s.Leases[lease.TokenHash] = cloneJSON(lease)
 	return writeJSONAtomic(filepath.Join(s.dir, leasesFile), s.Leases, 0o600)
 }
