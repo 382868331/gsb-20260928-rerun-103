@@ -343,6 +343,178 @@ func TestPurposeBorrowCannotReadAnotherVersion(t *testing.T) {
 	}
 }
 
+func TestDelegationIsBoundedAndCascadesRevocation(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "briefing", []byte("fictional-briefing-v1"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := svc.Borrow(ctx, "briefing", time.Hour, BorrowOptions{Purpose: "incident lead", Scopes: []Scope{ScopeReadMaterial, ScopeReadAudit}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := svc.Delegate(ctx, root.Token, 30*time.Minute, DelegateOptions{Purpose: "incident lead", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grandchild, err := svc.Delegate(ctx, child.Token, 15*time.Minute, DelegateOptions{Purpose: "incident lead", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked, err := svc.Use(ctx, grandchild.Token); err != nil || string(checked.Plaintext) != "fictional-briefing-v1" {
+		t.Fatalf("grandchild use = %v %#v", err, checked)
+	}
+	if _, err := svc.Delegate(ctx, child.Token, time.Minute, DelegateOptions{Purpose: "too much audit", Scopes: []Scope{ScopeReadAudit}}); !errors.Is(err, ErrLeaseScopeDenied) {
+		t.Fatalf("scope escalation = %v", err)
+	}
+	if _, err := svc.Delegate(ctx, child.Token, time.Hour, DelegateOptions{Purpose: "too long", Scopes: []Scope{ScopeReadMaterial}}); !errors.Is(err, ErrLeaseScopeDenied) {
+		t.Fatalf("expiry escalation = %v", err)
+	}
+	if _, err := svc.Delegate(ctx, child.Token, time.Minute, DelegateOptions{Purpose: "incident lead", Scopes: []Scope{ScopeReadMaterial}, VersionPolicy: VersionCurrent}); !errors.Is(err, ErrLeaseScopeDenied) {
+		t.Fatalf("version policy escalation = %v", err)
+	}
+	if _, err := svc.Delegate(ctx, child.Token, time.Minute, DelegateOptions{Purpose: "different purpose", Scopes: []Scope{ScopeReadMaterial}}); !errors.Is(err, ErrLeaseScopeDenied) {
+		t.Fatalf("purpose escalation = %v", err)
+	}
+	if err := svc.Revoke(ctx, child.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Use(ctx, grandchild.Token); !errors.Is(err, ErrLeaseRevoked) {
+		t.Fatalf("grandchild after upstream revoke = %v", err)
+	}
+	if _, err := svc.Use(ctx, root.Token); err != nil {
+		t.Fatalf("root affected by child revoke: %v", err)
+	}
+	events, err := svc.AuditEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cascade, denied AuditEvent
+	for _, event := range events {
+		if event.Action == "lease_revoked" && event.LeaseID == grandchild.ID {
+			cascade = event
+		}
+		if event.Action == "material_use" && event.LeaseID == grandchild.ID && event.Outcome == "denied" {
+			denied = event
+		}
+	}
+	if cascade.UpstreamLeaseID != child.ID || cascade.Reason != "upstream_revoked" {
+		t.Fatalf("cascade audit = %#v", cascade)
+	}
+	if denied.UpstreamLeaseID != child.ID || denied.Reason != ErrLeaseRevoked.Error() {
+		t.Fatalf("denial audit = %#v", denied)
+	}
+}
+
+func TestDelegationRotationPoliciesDoNotExpandAccess(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "briefing", []byte("fictional-briefing-v1"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := svc.Borrow(ctx, "briefing", time.Hour, BorrowOptions{Purpose: "current worker", Scopes: []Scope{ScopeReadMaterial}, VersionPolicy: VersionCurrent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := svc.Borrow(ctx, "briefing", time.Hour, BorrowOptions{Purpose: "pinned worker", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentChild, err := svc.Delegate(ctx, current.Token, time.Hour, DelegateOptions{Purpose: "current worker", Scopes: []Scope{ScopeReadMaterial}, VersionPolicy: VersionCurrent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedChild, err := svc.Delegate(ctx, pinned.Token, time.Hour, DelegateOptions{Purpose: "pinned worker", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := svc.RotateSecret(ctx, "briefing", []byte("fictional-briefing-v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{current.Token, currentChild.Token} {
+		checked, err := svc.Use(ctx, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checked.VersionID != v2 || string(checked.Plaintext) != "fictional-briefing-v2" {
+			t.Fatalf("current lease did not adopt v2: %#v", checked)
+		}
+	}
+	for _, token := range []string{pinned.Token, pinnedChild.Token} {
+		checked, err := svc.Use(ctx, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checked.VersionID == v2 || string(checked.Plaintext) != "fictional-briefing-v1" {
+			t.Fatalf("pinned lease adopted rotated version: %#v", checked)
+		}
+	}
+}
+
+func TestDelegationPersistsAcrossReopenAndExpiryExplainsUpstream(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := MustMasterKey(GenerateDemoMasterKey())
+	store, err := OpenStore(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newService(store, key, time.Now)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "briefing", []byte("fictional-persistent"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := svc.Borrow(ctx, "briefing", time.Minute, borrowOpts(ScopeReadMaterial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := svc.Delegate(ctx, root.Token, time.Minute, DelegateOptions{Purpose: "test purpose", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenDemoService(ctx, dir, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setClock(reopened, &now)
+	info, err := reopened.LeaseInfo(ctx, child.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ParentID != root.ID || info.VersionPolicy != VersionPinned {
+		t.Fatalf("reopened delegation metadata = %#v", info)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := reopened.Use(ctx, child.Token); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expired downstream use = %v", err)
+	}
+	events, err := reopened.AuditEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expiryDenied AuditEvent
+	for _, event := range events {
+		if strings.Contains(event.Reason, "fictional") {
+			t.Fatalf("audit exposed material: %#v", event)
+		}
+		if event.Action == "material_use" && event.LeaseID == child.ID && event.Outcome == "denied" {
+			expiryDenied = event
+		}
+	}
+	if expiryDenied.UpstreamLeaseID != root.ID || expiryDenied.Reason != ErrLeaseExpired.Error() {
+		t.Fatalf("expiry audit = %#v", expiryDenied)
+	}
+}
+
 func TestBatchSettleEndsOldLeasesAndKeepsRevocationTerminal(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := testService(t)
@@ -414,6 +586,41 @@ func TestExpiryAndRevokeCollision(t *testing.T) {
 	}
 	if _, err := svc.Use(ctx, lease.Token); !errors.Is(err, ErrLeaseRevoked) {
 		t.Fatalf("post-collision use = %v", err)
+	}
+}
+
+func TestDelegatedUseConcurrentWithUpstreamRevoke(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "race", []byte("delegated-collision-fictional"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := svc.Borrow(ctx, "race", time.Hour, borrowOpts(ScopeReadMaterial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := svc.Delegate(ctx, root.Token, time.Hour, DelegateOptions{Purpose: "test purpose", Scopes: []Scope{ScopeReadMaterial}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers = 24
+	var wg sync.WaitGroup
+	wg.Add(workers + 1)
+	go func() {
+		defer wg.Done()
+		_ = svc.Revoke(ctx, root.Token)
+	}()
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = svc.Use(ctx, child.Token)
+		}()
+	}
+	wg.Wait()
+	if _, err := svc.Use(ctx, child.Token); !errors.Is(err, ErrLeaseRevoked) {
+		t.Fatalf("child after concurrent upstream revoke = %v", err)
 	}
 }
 

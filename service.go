@@ -49,6 +49,18 @@ const (
 	SettleGracePeriod SettleRule = "grace_period"
 )
 
+// VersionPolicy controls whether a lease remains pinned to one material
+// version or may follow the current version after rotation.
+type VersionPolicy string
+
+const (
+	// VersionPinned keeps the lease on its issued/delegated version.
+	VersionPinned VersionPolicy = "pinned"
+	// VersionCurrent permits use of the current material version. Rotation
+	// updates the lease rather than widening any other part of the grant.
+	VersionCurrent VersionPolicy = "current"
+)
+
 type RotationPolicy struct {
 	OldLeases SettleRule
 	// GracePeriod is used only when OldLeases is SettleGracePeriod. Zero keeps
@@ -61,27 +73,31 @@ type SecretOptions struct {
 }
 
 type Lease struct {
-	ID         string
-	Token      string
-	SecretName string
-	VersionID  string
-	Purpose    string
-	Scopes     []Scope
-	IssuedAt   time.Time
-	ExpiresAt  time.Time
+	ID            string
+	ParentID      string
+	Token         string
+	SecretName    string
+	VersionID     string
+	VersionPolicy VersionPolicy
+	Purpose       string
+	Scopes        []Scope
+	IssuedAt      time.Time
+	ExpiresAt     time.Time
 }
 
 // LeaseView is the queryable description of a lease. It never carries the
 // bearer token or material plaintext.
 type LeaseView struct {
-	ID         string
-	SecretName string
-	VersionID  string
-	Purpose    string
-	Scopes     []Scope
-	IssuedAt   time.Time
-	ExpiresAt  time.Time
-	Revoked    bool
+	ID            string
+	ParentID      string
+	SecretName    string
+	VersionID     string
+	VersionPolicy VersionPolicy
+	Purpose       string
+	Scopes        []Scope
+	IssuedAt      time.Time
+	ExpiresAt     time.Time
+	Revoked       bool
 }
 
 type BorrowOptions struct {
@@ -89,6 +105,16 @@ type BorrowOptions struct {
 	// concurrent borrows with different purposes and scopes.
 	Purpose string
 	Scopes  []Scope
+	// VersionPolicy defaults to VersionPinned. VersionCurrent is the only
+	// grant that may adopt future rotated material.
+	VersionPolicy VersionPolicy
+}
+
+type DelegateOptions struct {
+	Purpose       string
+	Scopes        []Scope
+	VersionID     string
+	VersionPolicy VersionPolicy
 }
 
 type CheckedOutMaterial struct {
@@ -240,6 +266,10 @@ func (s *Service) RotateSecret(ctx context.Context, name string, plaintext []byt
 		return "", err
 	}
 
+	if err := s.updateCurrentVersionLeasesLocked(ctx, name, version.ID, now); err != nil {
+		return "", err
+	}
+
 	if fresh.RotationPolicy.OldLeases == SettleGracePeriod && fresh.RotationPolicy.GracePeriod > 0 {
 		deadline := now.Add(fresh.RotationPolicy.GracePeriod)
 		if _, err := s.settleLeaseBatchLocked(ctx, name, oldVersion, deadline, 0, now); err != nil {
@@ -277,6 +307,10 @@ func (s *Service) Borrow(ctx context.Context, name string, ttl time.Duration, op
 	if err != nil {
 		return nil, err
 	}
+	versionPolicy, err := normalizeVersionPolicy(spec.VersionPolicy)
+	if err != nil {
+		return nil, err
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -295,14 +329,15 @@ func (s *Service) Borrow(ctx context.Context, name string, ttl time.Duration, op
 		return nil, err
 	}
 	lease := &LeaseRecord{
-		ID:         "lease_" + hex.EncodeToString(idBytes),
-		TokenHash:  hashToken(token),
-		SecretName: name,
-		VersionID:  record.CurrentVersionID,
-		Purpose:    spec.Purpose,
-		Scopes:     scopeValues(scopes),
-		IssuedAt:   now.UTC(),
-		ExpiresAt:  now.Add(ttl).UTC(),
+		ID:            "lease_" + hex.EncodeToString(idBytes),
+		TokenHash:     hashToken(token),
+		SecretName:    name,
+		VersionID:     record.CurrentVersionID,
+		VersionPolicy: versionPolicy,
+		Purpose:       spec.Purpose,
+		Scopes:        scopeValues(scopes),
+		IssuedAt:      now.UTC(),
+		ExpiresAt:     now.Add(ttl).UTC(),
 	}
 	if err := s.store.SaveLease(ctx, lease); err != nil {
 		return nil, err
@@ -319,14 +354,97 @@ func (s *Service) Borrow(ctx context.Context, name string, ttl time.Duration, op
 	return lease.toLease(token), nil
 }
 
+// Delegate creates a strictly bounded temporary downstream lease.
+func (s *Service) Delegate(ctx context.Context, parentToken string, ttl time.Duration, opts DelegateOptions) (*Lease, error) {
+	if ttl <= 0 {
+		return nil, fmt.Errorf("%w: ttl must be positive", ErrInvalidArgument)
+	}
+	opts.Purpose = strings.TrimSpace(opts.Purpose)
+	if opts.Purpose == "" {
+		return nil, fmt.Errorf("%w: purpose is required", ErrInvalidArgument)
+	}
+	scopes, err := normalizeScopes(opts.Scopes)
+	if err != nil {
+		return nil, err
+	}
+	requestedPolicy, err := normalizeVersionPolicy(opts.VersionPolicy)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.now()
+	parent, record, upstream, err := s.activeLease(parentToken, now)
+	if err != nil {
+		s.appendLeaseDeniedAudit(ctx, "lease_delegated", parent, upstream, now, err)
+		return nil, err
+	}
+	if opts.Purpose != parent.Purpose {
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: parent.SecretName, Version: parent.VersionID, LeaseID: parent.ID, Outcome: "denied", Reason: "upstream_purpose_denied"})
+		return nil, fmt.Errorf("%w: requested purpose exceeds upstream lease", ErrLeaseScopeDenied)
+	}
+	if !scopesContained(scopes, parent.Scopes) {
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: parent.SecretName, Version: parent.VersionID, LeaseID: parent.ID, Outcome: "denied", Reason: "upstream_scope_denied"})
+		return nil, fmt.Errorf("%w: requested scopes exceed upstream lease", ErrLeaseScopeDenied)
+	}
+	if requestedPolicy == VersionCurrent && effectiveVersionPolicy(parent.VersionPolicy) != VersionCurrent {
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: parent.SecretName, Version: parent.VersionID, LeaseID: parent.ID, Outcome: "denied", Reason: "upstream_version_policy_denied"})
+		return nil, fmt.Errorf("%w: upstream lease cannot adopt rotated versions", ErrLeaseScopeDenied)
+	}
+	requestedVersion := opts.VersionID
+	if requestedVersion == "" {
+		requestedVersion = parent.VersionID
+	}
+	if requestedPolicy == VersionCurrent {
+		requestedVersion = record.CurrentVersionID
+	}
+	if requestedVersion != parent.VersionID {
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: parent.SecretName, Version: requestedVersion, LeaseID: parent.ID, Outcome: "denied", Reason: "upstream_version_denied"})
+		return nil, fmt.Errorf("%w: requested material version exceeds upstream lease", ErrLeaseScopeDenied)
+	}
+	expiresAt := now.Add(ttl).UTC()
+	if expiresAt.After(parent.ExpiresAt) {
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: parent.SecretName, Version: requestedVersion, LeaseID: parent.ID, Outcome: "denied", Reason: "upstream_expiry_denied"})
+		return nil, fmt.Errorf("%w: requested expiry exceeds upstream lease", ErrLeaseScopeDenied)
+	}
+
+	token, _, err := s.newToken()
+	if err != nil {
+		return nil, err
+	}
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return nil, err
+	}
+	lease := &LeaseRecord{
+		ID:            "lease_" + hex.EncodeToString(idBytes),
+		TokenHash:     hashToken(token),
+		ParentID:      parent.ID,
+		SecretName:    parent.SecretName,
+		VersionID:     requestedVersion,
+		VersionPolicy: requestedPolicy,
+		Purpose:       opts.Purpose,
+		Scopes:        scopeValues(scopes),
+		IssuedAt:      now.UTC(),
+		ExpiresAt:     expiresAt,
+	}
+	if err := s.store.SaveLease(ctx, lease); err != nil {
+		return nil, err
+	}
+	s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_delegated", Secret: lease.SecretName, Version: lease.VersionID, LeaseID: lease.ID, UpstreamLeaseID: parent.ID, KeyID: s.key.ID(), Outcome: "ok"})
+	return lease.toLease(token), nil
+}
+
 func (s *Service) Use(ctx context.Context, token string) (*CheckedOutMaterial, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := s.now()
-	lease, record, err := s.activeLease(token, now)
+	lease, record, upstream, err := s.activeLease(token, now)
 	if err != nil {
-		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "material_use", Outcome: "denied", Reason: safeReason(err)})
+		s.appendLeaseDeniedAudit(ctx, "material_use", lease, upstream, now, err)
 		return nil, err
 	}
 	if !leaseHasScope(lease, ScopeReadMaterial) {
@@ -371,9 +489,9 @@ func (s *Service) LeaseInfo(ctx context.Context, token string) (*LeaseView, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	lease, _, err := s.activeLease(token, now)
+	lease, _, upstream, err := s.activeLease(token, now)
 	if err != nil {
-		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_query", Outcome: "denied", Reason: safeReason(err)})
+		s.appendLeaseDeniedAudit(ctx, "lease_query", lease, upstream, now, err)
 		return nil, err
 	}
 	return lease.toView(), nil
@@ -385,9 +503,9 @@ func (s *Service) AuditEventsForLease(ctx context.Context, token string) ([]Audi
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	lease, _, err := s.activeLease(token, now)
+	lease, _, upstream, err := s.activeLease(token, now)
 	if err != nil {
-		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "audit_query", Outcome: "denied", Reason: safeReason(err)})
+		s.appendLeaseDeniedAudit(ctx, "audit_query", lease, upstream, now, err)
 		return nil, err
 	}
 	if !leaseHasScope(lease, ScopeReadAudit) {
@@ -438,6 +556,9 @@ func (s *Service) Revoke(ctx context.Context, token string) error {
 			return err
 		}
 	}
+	if err := s.revokeDownstreamLocked(ctx, lease.ID, now); err != nil {
+		return err
+	}
 	s.store.AppendAudit(ctx, AuditEvent{
 		At:      now.UTC(),
 		Action:  "lease_revoked",
@@ -447,6 +568,34 @@ func (s *Service) Revoke(ctx context.Context, token string) error {
 		KeyID:   s.key.ID(),
 		Outcome: "ok",
 	})
+	return nil
+}
+
+func (s *Service) revokeDownstreamLocked(ctx context.Context, parentID string, now time.Time) error {
+	var ids []string
+	children := make(map[string]*LeaseRecord)
+	for _, lease := range s.store.Leases {
+		if lease.ParentID == parentID && lease.RevokedAt.IsZero() && now.Before(lease.ExpiresAt) {
+			ids = append(ids, lease.ID)
+			children[lease.ID] = lease
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		lease := s.store.Leases[children[id].TokenHash]
+		if lease == nil || lease.ParentID != parentID || !lease.RevokedAt.IsZero() || !now.Before(lease.ExpiresAt) {
+			continue
+		}
+		lease.RevokedAt = now.UTC()
+		lease.RevokedReason = "upstream_revoked"
+		if err := s.store.SaveLease(ctx, lease); err != nil {
+			return err
+		}
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_revoked", Secret: lease.SecretName, Version: lease.VersionID, LeaseID: lease.ID, UpstreamLeaseID: parentID, KeyID: s.key.ID(), Outcome: "ok", Reason: "upstream_revoked"})
+		if err := s.revokeDownstreamLocked(ctx, lease.ID, now); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -460,22 +609,109 @@ func (s *Service) sealVersion(number int, plaintext []byte) (*EncryptedVersion, 
 	return s.key.Seal(fmt.Sprintf("v%d", number), plaintext)
 }
 
-func (s *Service) activeLease(token string, now time.Time) (*LeaseRecord, *SecretRecord, error) {
+func (s *Service) activeLease(token string, now time.Time) (*LeaseRecord, *SecretRecord, *LeaseRecord, error) {
 	lease, ok := s.store.Leases[hashToken(token)]
 	if !ok {
-		return nil, nil, ErrInvalidLease
+		return nil, nil, nil, ErrInvalidLease
 	}
-	if !lease.RevokedAt.IsZero() {
-		return nil, nil, ErrLeaseRevoked
-	}
-	if !now.Before(lease.ExpiresAt) {
-		return nil, nil, ErrLeaseExpired
+	if _, upstream, err := s.activeLeaseChainLocked(lease, now); err != nil {
+		return lease, nil, upstream, err
 	}
 	record, ok := s.store.Materials[lease.SecretName]
 	if !ok {
-		return nil, nil, ErrSecretNotFound
+		return lease, nil, nil, ErrSecretNotFound
 	}
-	return lease, record, nil
+	return lease, record, nil, nil
+}
+
+func (s *Service) activeLeaseChainLocked(lease *LeaseRecord, now time.Time) (*LeaseRecord, *LeaseRecord, error) {
+	visited := make(map[string]bool)
+	current := lease
+	for {
+		if visited[current.ID] {
+			return lease, nil, fmt.Errorf("%w: delegation cycle", ErrInvalidLease)
+		}
+		visited[current.ID] = true
+		if current.ParentID != "" {
+			parent := s.findLeaseByIDLocked(current.ParentID)
+			if parent == nil {
+				return lease, nil, fmt.Errorf("%w: upstream lease is missing", ErrInvalidLease)
+			}
+			if !parent.RevokedAt.IsZero() {
+				return lease, parent, ErrLeaseRevoked
+			}
+			if !now.Before(parent.ExpiresAt) {
+				return lease, parent, ErrLeaseExpired
+			}
+		}
+		if !current.RevokedAt.IsZero() {
+			if current.RevokedReason == "upstream_revoked" && current.ParentID != "" {
+				if parent := s.findLeaseByIDLocked(current.ParentID); parent != nil {
+					return lease, parent, ErrLeaseRevoked
+				}
+			}
+			return lease, current, ErrLeaseRevoked
+		}
+		if !now.Before(current.ExpiresAt) {
+			return lease, current, ErrLeaseExpired
+		}
+		if current.ParentID == "" {
+			return lease, current, nil
+		}
+		parent := s.findLeaseByIDLocked(current.ParentID)
+		current = parent
+	}
+}
+
+func (s *Service) findLeaseByIDLocked(id string) *LeaseRecord {
+	for _, lease := range s.store.Leases {
+		if lease.ID == id {
+			return lease
+		}
+	}
+	return nil
+}
+
+func (s *Service) appendLeaseDeniedAudit(ctx context.Context, action string, lease, upstream *LeaseRecord, now time.Time, err error) {
+	event := AuditEvent{At: now.UTC(), Action: action, Outcome: "denied", Reason: safeReason(err)}
+	if lease != nil {
+		event.Secret = lease.SecretName
+		event.Version = lease.VersionID
+		event.LeaseID = lease.ID
+	}
+	if upstream != nil && upstream.ID != event.LeaseID {
+		event.UpstreamLeaseID = upstream.ID
+	}
+	s.store.AppendAudit(ctx, event)
+}
+
+func (s *Service) updateCurrentVersionLeasesLocked(ctx context.Context, name, versionID string, now time.Time) error {
+	ids := make([]string, 0)
+	byID := make(map[string]*LeaseRecord)
+	for _, lease := range s.store.Leases {
+		if lease.SecretName != name || effectiveVersionPolicy(lease.VersionPolicy) != VersionCurrent || !lease.IsActive(now) {
+			continue
+		}
+		if _, _, err := s.activeLeaseChainLocked(lease, now); err != nil {
+			continue
+		}
+		ids = append(ids, lease.ID)
+		byID[lease.ID] = lease
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		lease := s.store.Leases[byID[id].TokenHash]
+		if lease == nil || !lease.IsActive(now) || effectiveVersionPolicy(lease.VersionPolicy) != VersionCurrent || lease.VersionID == versionID {
+			continue
+		}
+		prior := lease.VersionID
+		lease.VersionID = versionID
+		if err := s.store.SaveLease(ctx, lease); err != nil {
+			return err
+		}
+		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "lease_version_updated", Secret: name, Version: versionID, PriorVersion: prior, LeaseID: lease.ID, KeyID: s.key.ID(), Outcome: "ok"})
+	}
+	return nil
 }
 
 // settleLeaseBatchLocked applies a deterministic upper-bound expiry to active
@@ -554,6 +790,40 @@ func normalizeScopes(values []Scope) ([]Scope, error) {
 		seen[value] = true
 	}
 	return append([]Scope(nil), values...), nil
+}
+
+func normalizeVersionPolicy(policy VersionPolicy) (VersionPolicy, error) {
+	switch policy {
+	case "":
+		return VersionPinned, nil
+	case VersionPinned, VersionCurrent:
+		return policy, nil
+	default:
+		return "", fmt.Errorf("%w: unknown version policy %q", ErrInvalidArgument, policy)
+	}
+}
+
+func effectiveVersionPolicy(policy VersionPolicy) VersionPolicy {
+	if policy == VersionCurrent {
+		return VersionCurrent
+	}
+	return VersionPinned
+}
+
+func scopesContained(requested []Scope, allowed []string) bool {
+	for _, scope := range requested {
+		found := false
+		for _, value := range allowed {
+			if Scope(value) == scope {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func leaseHasScope(lease *LeaseRecord, scope Scope) bool {
