@@ -546,6 +546,279 @@ func TestPublicErrorsAndAuditNeverRevealSecrets(t *testing.T) {
 	}
 }
 
+func TestMultiLevelDelegationCannotExceedUpstream(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "dossier", []byte("v1-fictional-dossier"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	root, err := svc.Borrow(ctx, "dossier", time.Hour, BorrowOptions{
+		Purpose: "incident",
+		Scopes:  []Scope{ScopeReadMaterial, ScopeReadAudit},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := svc.Delegate(ctx, root.Token, DelegateOptions{
+		Purpose: "incident/triage",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grand, err := svc.Delegate(ctx, child.Token, DelegateOptions{
+		Purpose: "incident/triage/check",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checked, err := svc.Use(ctx, grand.Token)
+	if err != nil || string(checked.Plaintext) != "v1-fictional-dossier" {
+		t.Fatalf("grandchild use = %v %#v", err, checked)
+	}
+
+	for _, opts := range []DelegateOptions{
+		{Purpose: "other", Scopes: []Scope{ScopeReadMaterial}, TTL: time.Minute},
+		{Purpose: "incident/triage", Scopes: []Scope{ScopeReadAudit}, TTL: time.Minute},
+		{Purpose: "incident/triage", Scopes: []Scope{ScopeReadMaterial}, TTL: time.Hour},
+		{Purpose: "incident/triage", Scopes: []Scope{ScopeReadMaterial}, TTL: time.Minute, AllowsNewVersions: true},
+	} {
+		if _, err := svc.Delegate(ctx, child.Token, opts); !errors.Is(err, ErrDelegationDenied) {
+			t.Fatalf("delegation %#v = %v", opts, err)
+		}
+	}
+
+	if err := svc.Revoke(ctx, child.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Use(ctx, child.Token); !errors.Is(err, ErrLeaseRevoked) {
+		t.Fatalf("revoked child = %v", err)
+	}
+	if _, err := svc.Use(ctx, grand.Token); !errors.Is(err, ErrUpstreamLeaseRevoked) {
+		t.Fatalf("grandchild after upstream revoke = %v", err)
+	}
+	if checked, err := svc.Use(ctx, root.Token); err != nil || string(checked.Plaintext) != "v1-fictional-dossier" {
+		t.Fatalf("root after child revoke = %v %#v", err, checked)
+	}
+}
+
+func TestDelegationRotationTracksPinnedAndCurrentVersionLeases(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	key := MustMasterKey(GenerateDemoMasterKey())
+	store, err := OpenStore(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newService(store, key, time.Now)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "briefing", []byte("v1-fictional-briefing"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	currentRoot, err := svc.Borrow(ctx, "briefing", time.Hour, BorrowOptions{
+		Purpose:           "current",
+		Scopes:            []Scope{ScopeReadMaterial},
+		AllowsNewVersions: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentChild, err := svc.Delegate(ctx, currentRoot.Token, DelegateOptions{
+		Purpose:           "current/worker",
+		Scopes:            []Scope{ScopeReadMaterial},
+		TTL:               30 * time.Minute,
+		AllowsNewVersions: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedRoot, err := svc.Borrow(ctx, "briefing", time.Hour, BorrowOptions{
+		Purpose: "pinned",
+		Scopes:  []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedChild, err := svc.Delegate(ctx, pinnedRoot.Token, DelegateOptions{
+		Purpose: "pinned/worker",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now = now.Add(time.Minute)
+	v2, err := svc.RotateSecret(ctx, "briefing", []byte("v2-fictional-briefing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinnedGrandchild, err := svc.Delegate(ctx, pinnedChild.Token, DelegateOptions{
+		Purpose: "pinned/worker/check",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v3, err := svc.RotateSecret(ctx, "briefing", []byte("v3-fictional-briefing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mustUse := func(token, want string) {
+		t.Helper()
+		checked, err := svc.Use(ctx, token)
+		if err != nil || string(checked.Plaintext) != want {
+			t.Fatalf("use = %v %#v, want %q", err, checked, want)
+		}
+	}
+	mustUse(currentRoot.Token, "v3-fictional-briefing")
+	mustUse(currentChild.Token, "v3-fictional-briefing")
+	mustUse(pinnedRoot.Token, "v1-fictional-briefing")
+	mustUse(pinnedChild.Token, "v1-fictional-briefing")
+	mustUse(pinnedGrandchild.Token, "v1-fictional-briefing")
+	if info, err := svc.LeaseInfo(ctx, currentChild.Token); err != nil || info.VersionID != v3 || !info.AllowsNewVersions || info.ParentID != currentRoot.ID {
+		t.Fatalf("current child info = %#v, %v", info, err)
+	}
+	if info, err := svc.LeaseInfo(ctx, pinnedGrandchild.Token); err != nil || info.VersionID != pinnedGrandchild.VersionID || info.VersionID == v2 {
+		t.Fatalf("pinned grandchild changed baseline: %#v, %v (v2 id %s)", info, err, v2)
+	}
+
+	if err := svc.Revoke(ctx, currentRoot.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopenedStore, err := OpenStore(ctx, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened := newService(reopenedStore, key, func() time.Time { return now })
+	if _, err := reopened.Use(ctx, currentChild.Token); !errors.Is(err, ErrUpstreamLeaseRevoked) {
+		t.Fatalf("reopened downstream = %v", err)
+	}
+	checked, err := reopened.Use(ctx, pinnedChild.Token)
+	if err != nil || string(checked.Plaintext) != "v1-fictional-briefing" {
+		t.Fatalf("reopened pinned use = %v %#v", err, checked)
+	}
+}
+
+func TestDelegationAuditExplainsExpiryRevocationWithoutMaterial(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 9, 29, 10, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	plaintext := []byte("sensitive-fictional-delegation-material")
+	if _, err := svc.CreateSecret(ctx, "case", plaintext, SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	shortRoot, err := svc.Borrow(ctx, "case", time.Millisecond, BorrowOptions{
+		Purpose: "case",
+		Scopes:  []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiringChild, err := svc.Delegate(ctx, shortRoot.Token, DelegateOptions{
+		Purpose: "case/short",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Millisecond)
+	if _, err := svc.Use(ctx, expiringChild.Token); !errors.Is(err, ErrUpstreamLeaseExpired) {
+		t.Fatalf("upstream expiry = %v", err)
+	}
+
+	now = time.Date(2026, 9, 29, 11, 0, 0, 0, time.UTC)
+	root, err := svc.Borrow(ctx, "case", 2*time.Hour, BorrowOptions{
+		Purpose: "case",
+		Scopes:  []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := svc.Delegate(ctx, root.Token, DelegateOptions{
+		Purpose: "case/concurrent",
+		Scopes:  []Scope{ScopeReadMaterial},
+		TTL:     90 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var useErr error
+	go func() { defer wg.Done(); _, useErr = svc.Use(ctx, child.Token) }()
+	go func() { defer wg.Done(); _ = svc.Revoke(ctx, root.Token) }()
+	wg.Wait()
+	if useErr != nil && !errors.Is(useErr, ErrUpstreamLeaseRevoked) {
+		t.Fatalf("concurrent child use = %v", useErr)
+	}
+	if _, err := svc.Use(ctx, child.Token); !errors.Is(err, ErrUpstreamLeaseRevoked) {
+		t.Fatalf("post-collision child use = %v", err)
+	}
+
+	events, err := svc.AuditEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deniedUse []AuditEvent
+	for _, event := range events {
+		if event.Action == "material_use" && event.Outcome == "denied" {
+			deniedUse = append(deniedUse, event)
+		}
+	}
+	if len(deniedUse) < 2 {
+		t.Fatalf("denied use events = %d", len(deniedUse))
+	}
+	reasons := map[string]bool{}
+	tokens := map[string]bool{
+		expiringChild.Token: true,
+		child.Token:         true,
+		root.Token:          true,
+		shortRoot.Token:     true,
+	}
+	for _, event := range deniedUse {
+		reasons[event.Reason] = true
+		if strings.Contains(event.Reason, string(plaintext)) {
+			t.Fatalf("audit reason leaked material: %#v", event)
+		}
+	}
+	if !reasons[ErrUpstreamLeaseExpired.Error()] || !reasons[ErrUpstreamLeaseRevoked.Error()] {
+		t.Fatalf("audit reasons = %#v", reasons)
+	}
+	events, err = svc.AuditEvents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := jsonMarshalEvents(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encoded, string(plaintext)) {
+		t.Fatal("audit contained delegated material")
+	}
+	for token := range tokens {
+		if strings.Contains(encoded, token) {
+			t.Fatal("audit contained delegated bearer token")
+		}
+	}
+}
+
 func jsonMarshalEvents(events []AuditEvent) (string, error) {
 	var builder strings.Builder
 	for _, event := range events {

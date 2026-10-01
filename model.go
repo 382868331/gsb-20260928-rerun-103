@@ -19,16 +19,18 @@ func (r *SecretRecord) Version(id string) *EncryptedVersion {
 }
 
 type LeaseRecord struct {
-	ID         string    `json:"id"`
-	TokenHash  string    `json:"token_hash"`
-	SecretName string    `json:"secret_name"`
-	VersionID  string    `json:"version_id"`
-	Purpose    string    `json:"purpose"`
-	Scopes     []string  `json:"scopes,omitempty"`
-	IssuedAt   time.Time `json:"issued_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	RevokedAt  time.Time `json:"revoked_at,omitempty"`
-	SettleRule string    `json:"settle_rule,omitempty"`
+	ID                string    `json:"id"`
+	TokenHash         string    `json:"token_hash"`
+	ParentID          string    `json:"parent_id,omitempty"`
+	SecretName        string    `json:"secret_name"`
+	VersionID         string    `json:"version_id"`
+	Purpose           string    `json:"purpose"`
+	Scopes            []string  `json:"scopes,omitempty"`
+	AllowsNewVersions bool      `json:"allows_new_versions,omitempty"`
+	IssuedAt          time.Time `json:"issued_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	RevokedAt         time.Time `json:"revoked_at,omitempty"`
+	SettleRule        string    `json:"settle_rule,omitempty"`
 }
 
 func (r *LeaseRecord) IsActive(now time.Time) bool {
@@ -37,14 +39,16 @@ func (r *LeaseRecord) IsActive(now time.Time) bool {
 
 func (r *LeaseRecord) toLease(token string) *Lease {
 	return &Lease{
-		ID:         r.ID,
-		Token:      token,
-		SecretName: r.SecretName,
-		VersionID:  r.VersionID,
-		Purpose:    r.Purpose,
-		Scopes:     append([]Scope(nil), scopeStrings(r.Scopes)...),
-		IssuedAt:   r.IssuedAt,
-		ExpiresAt:  r.ExpiresAt,
+		ID:                r.ID,
+		Token:             token,
+		ParentID:          r.ParentID,
+		SecretName:        r.SecretName,
+		VersionID:         r.VersionID,
+		Purpose:           r.Purpose,
+		Scopes:            append([]Scope(nil), scopeStrings(r.Scopes)...),
+		AllowsNewVersions: r.AllowsNewVersions,
+		IssuedAt:          r.IssuedAt,
+		ExpiresAt:         r.ExpiresAt,
 	}
 }
 func (r *LeaseRecord) toView() *LeaseView {
@@ -53,25 +57,29 @@ func (r *LeaseRecord) toView() *LeaseView {
 		scopes[i] = Scope(value)
 	}
 	return &LeaseView{
-		ID:         r.ID,
-		SecretName: r.SecretName,
-		VersionID:  r.VersionID,
-		Purpose:    r.Purpose,
-		Scopes:     scopes,
-		IssuedAt:   r.IssuedAt,
-		ExpiresAt:  r.ExpiresAt,
-		Revoked:    !r.RevokedAt.IsZero(),
+		ID:                r.ID,
+		ParentID:          r.ParentID,
+		SecretName:        r.SecretName,
+		VersionID:         r.VersionID,
+		Purpose:           r.Purpose,
+		Scopes:            scopes,
+		AllowsNewVersions: r.AllowsNewVersions,
+		IssuedAt:          r.IssuedAt,
+		ExpiresAt:         r.ExpiresAt,
+		Revoked:           !r.RevokedAt.IsZero(),
 	}
 }
 
 type AuditEvent struct {
-	At           time.Time `json:"at"`
-	Action       string    `json:"action"`
-	Outcome      string    `json:"outcome"`
-	Secret       string    `json:"secret,omitempty"`
-	Version      string    `json:"version,omitempty"`
-	PriorVersion string    `json:"prior_version,omitempty"`
-	LeaseID      string    `json:"lease_id,omitempty"`
-	KeyID        string    `json:"key_id,omitempty"`
-	Reason       string    `json:"reason,omitempty"`
+	At            time.Time `json:"at"`
+	Action        string    `json:"action"`
+	Outcome       string    `json:"outcome"`
+	Secret        string    `json:"secret,omitempty"`
+	Version       string    `json:"version,omitempty"`
+	PriorVersion  string    `json:"prior_version,omitempty"`
+	LeaseID       string    `json:"lease_id,omitempty"`
+	ActorLeaseID  string    `json:"actor_lease_id,omitempty"`
+	ParentLeaseID string    `json:"parent_lease_id,omitempty"`
+	KeyID         string    `json:"key_id,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
 }
