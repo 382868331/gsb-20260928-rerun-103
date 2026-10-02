@@ -14,12 +14,14 @@ const (
 	materialsFile = "secret-materials.json"
 	leasesFile    = "lease-credentials.json"
 	auditFile     = "usage-audit.jsonl"
+	factsFile     = "authorization-facts.json"
 )
 
 type Store struct {
 	dir       string
 	Materials map[string]*SecretRecord
 	Leases    map[string]*LeaseRecord
+	Facts     *AuthorizationFacts
 	auditFile *os.File
 }
 
@@ -36,6 +38,9 @@ func OpenStore(ctx context.Context, dir string) (*Store, error) {
 		return nil, err
 	}
 	if err := store.loadLeases(); err != nil {
+		return nil, err
+	}
+	if err := store.loadFacts(); err != nil {
 		return nil, err
 	}
 	if err := store.openAudit(ctx); err != nil {
@@ -60,6 +65,12 @@ func (s *Store) SaveLease(ctx context.Context, lease *LeaseRecord) error {
 	}
 	s.Leases[lease.TokenHash] = cloneJSON(lease)
 	return writeJSONAtomic(filepath.Join(s.dir, leasesFile), s.Leases, 0o600)
+}
+
+func (s *Store) SaveFacts(ctx context.Context, facts *AuthorizationFacts) error {
+	_ = ctx
+	s.Facts = cloneJSON(facts)
+	return writeJSONAtomic(filepath.Join(s.dir, factsFile), s.Facts, 0o600)
 }
 
 func (s *Store) AppendAudit(ctx context.Context, event AuditEvent) {
@@ -130,6 +141,20 @@ func (s *Store) loadLeases() error {
 	}
 	if s.Leases == nil {
 		s.Leases = make(map[string]*LeaseRecord)
+	}
+	return nil
+}
+
+func (s *Store) loadFacts() error {
+	path := filepath.Join(s.dir, factsFile)
+	if err := readJSON(path, &s.Facts); err != nil {
+		return err
+	}
+	if s.Facts == nil {
+		s.Facts = &AuthorizationFacts{
+			Secrets: make(map[string]*SecretFact),
+			Leases:  make(map[string]*LeaseFact),
+		}
 	}
 	return nil
 }

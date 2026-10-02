@@ -191,6 +191,9 @@ func (s *Service) CreateSecret(ctx context.Context, name string, plaintext []byt
 	if err := s.store.SaveSecret(ctx, record); err != nil {
 		return "", err
 	}
+	if err := s.persistFactsLocked(ctx); err != nil {
+		return "", err
+	}
 	s.store.AppendAudit(ctx, AuditEvent{
 		At:      s.now().UTC(),
 		Action:  "secret_created",
@@ -273,6 +276,9 @@ func (s *Service) RotateSecret(ctx context.Context, name string, plaintext []byt
 		KeyID:        s.key.ID(),
 		Outcome:      "ok",
 	})
+	if err := s.persistFactsLocked(ctx); err != nil {
+		return "", err
+	}
 	return version.ID, nil
 }
 
@@ -324,6 +330,9 @@ func (s *Service) Borrow(ctx context.Context, name string, ttl time.Duration, op
 		ExpiresAt:         now.Add(ttl).UTC(),
 	}
 	if err := s.store.SaveLease(ctx, lease); err != nil {
+		return nil, err
+	}
+	if err := s.persistFactsLocked(ctx); err != nil {
 		return nil, err
 	}
 	s.store.AppendAudit(ctx, AuditEvent{
@@ -410,6 +419,9 @@ func (s *Service) Delegate(ctx context.Context, parentToken string, opts Delegat
 		ExpiresAt:         childExpiry,
 	}
 	if err := s.store.SaveLease(ctx, child); err != nil {
+		return nil, err
+	}
+	if err := s.persistFactsLocked(ctx); err != nil {
 		return nil, err
 	}
 	s.store.AppendAudit(ctx, AuditEvent{
@@ -527,7 +539,14 @@ func (s *Service) SettleOldLeases(ctx context.Context, name string, limit int) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
-	return s.settleLeaseBatchLocked(ctx, name, "", now, limit, now)
+	changed, err := s.settleLeaseBatchLocked(ctx, name, "", now, limit, now)
+	if err != nil {
+		return changed, err
+	}
+	if err := s.persistFactsLocked(ctx); err != nil {
+		return changed, err
+	}
+	return changed, nil
 }
 
 // Revoke is idempotent. Repeating it for an already revoked lease does not
@@ -578,6 +597,9 @@ func (s *Service) Revoke(ctx context.Context, token string) error {
 		KeyID:   s.key.ID(),
 		Outcome: "ok",
 	})
+	if err := s.persistFactsLocked(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
