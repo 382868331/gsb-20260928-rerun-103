@@ -235,7 +235,7 @@ func TestAuditDoesNotContainPlaintextOrBearerToken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 4 {
+	if len(events) != 5 {
 		t.Fatalf("events = %d", len(events))
 	}
 	for _, file := range []string{materialsFile, leasesFile, auditFile} {

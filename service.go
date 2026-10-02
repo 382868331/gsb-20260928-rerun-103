@@ -427,6 +427,16 @@ func (s *Service) Delegate(ctx context.Context, parentToken string, opts Delegat
 }
 
 func (s *Service) Use(ctx context.Context, token string) (*CheckedOutMaterial, error) {
+	material, _, err := s.UseWithReceipt(ctx, token)
+	return material, err
+}
+
+// UseWithReceipt behaves like Use but additionally returns a signed usage
+// receipt for the decision, whether it allowed or denied the checkout. The
+// receipt attests the full delegation chain as recorded at decision time and
+// can be verified offline with the key from ReceiptPublicKey. It never
+// contains material plaintext or tokens.
+func (s *Service) UseWithReceipt(ctx context.Context, token string) (*CheckedOutMaterial, *UsageReceipt, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -434,26 +444,30 @@ func (s *Service) Use(ctx context.Context, token string) (*CheckedOutMaterial, e
 	lease, record, err := s.authorizedLease(token, now)
 	if err != nil {
 		s.appendTokenDeniedAudit(ctx, "material_use", token, now, err)
-		return nil, err
+		receipt := s.deniedReceiptLocked(ctx, token, now, err)
+		return nil, receipt, err
 	}
 	versionID := s.effectiveVersionIDLocked(lease, record)
 	if !leaseHasScope(lease, ScopeReadMaterial) {
 		s.appendLeaseDeniedAudit(ctx, "material_use", lease, now, ErrLeaseScopeDenied)
-		return nil, ErrLeaseScopeDenied
+		receipt := s.issueReceiptLocked(ctx, lease, versionID, ReceiptDecisionDenied, "scope_denied", now)
+		return nil, receipt, ErrLeaseScopeDenied
 	}
 	encrypted := record.Version(versionID)
 	if encrypted == nil {
 		err := fmt.Errorf("%w: version %s is missing", ErrMaterialCannotDecrypt, lease.VersionID)
 		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "material_use", Secret: lease.SecretName, Version: versionID, LeaseID: lease.ID, Outcome: "denied", Reason: "decryption_key_unavailable"})
-		return nil, err
+		receipt := s.issueReceiptLocked(ctx, lease, versionID, ReceiptDecisionDenied, "decryption_key_unavailable", now)
+		return nil, receipt, err
 	}
 	plaintext, err := s.key.Open(encrypted)
 	if err != nil {
 		s.store.AppendAudit(ctx, AuditEvent{At: now.UTC(), Action: "material_use", Secret: lease.SecretName, Version: versionID, LeaseID: lease.ID, KeyID: s.key.ID(), Outcome: "denied", Reason: "decryption_key_unavailable"})
+		receipt := s.issueReceiptLocked(ctx, lease, versionID, ReceiptDecisionDenied, "decryption_key_unavailable", now)
 		if errors.Is(err, ErrWrongMasterKey) {
-			return nil, ErrMaterialCannotDecrypt
+			return nil, receipt, ErrMaterialCannotDecrypt
 		}
-		return nil, err
+		return nil, receipt, err
 	}
 	s.store.AppendAudit(ctx, AuditEvent{
 		At:      now.UTC(),
@@ -464,13 +478,46 @@ func (s *Service) Use(ctx context.Context, token string) (*CheckedOutMaterial, e
 		KeyID:   s.key.ID(),
 		Outcome: "ok",
 	})
+	receipt := s.issueReceiptLocked(ctx, lease, versionID, ReceiptDecisionAllowed, "", now)
 	return &CheckedOutMaterial{
 		SecretName: lease.SecretName,
 		VersionID:  versionID,
 		Purpose:    lease.Purpose,
 		Plaintext:  plaintext,
 		ExpiresAt:  lease.ExpiresAt,
-	}, nil
+	}, receipt, nil
+}
+
+// issueReceiptLocked signs a receipt for a decided use and records the
+// issuance in the audit trail. Receipt-building failures never block the
+// material decision itself; they surface as nil receipts.
+func (s *Service) issueReceiptLocked(ctx context.Context, lease *LeaseRecord, versionID, decision, reason string, now time.Time) *UsageReceipt {
+	receipt, err := s.buildReceiptLocked(lease, versionID, decision, reason, now)
+	if err != nil {
+		return nil
+	}
+	s.store.AppendAudit(ctx, AuditEvent{
+		At:      now.UTC(),
+		Action:  "receipt_issued",
+		Secret:  lease.SecretName,
+		Version: versionID,
+		LeaseID: lease.ID,
+		KeyID:   s.store.ReceiptKeyID(),
+		Outcome: decision,
+		Reason:  reason,
+	})
+	return receipt
+}
+
+// deniedReceiptLocked issues a denied receipt when the token maps to a known
+// lease whose chain is no longer usable (expired, revoked, or upstream
+// broken). Unknown tokens get no receipt because no subject can be named.
+func (s *Service) deniedReceiptLocked(ctx context.Context, token string, now time.Time, err error) *UsageReceipt {
+	lease := s.leaseByTokenHashLocked(hashToken(token))
+	if lease == nil {
+		return nil
+	}
+	return s.issueReceiptLocked(ctx, lease, lease.VersionID, ReceiptDecisionDenied, safeReason(err), now)
 }
 
 // LeaseInfo exposes only metadata. Callers cannot use the view to obtain the

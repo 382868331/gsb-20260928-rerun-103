@@ -3,6 +3,11 @@ package localsecretmaterials
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,9 +16,10 @@ import (
 )
 
 const (
-	materialsFile = "secret-materials.json"
-	leasesFile    = "lease-credentials.json"
-	auditFile     = "usage-audit.jsonl"
+	materialsFile  = "secret-materials.json"
+	leasesFile     = "lease-credentials.json"
+	auditFile      = "usage-audit.jsonl"
+	receiptKeyFile = "receipt-signing-key.json"
 )
 
 type Store struct {
@@ -21,6 +27,10 @@ type Store struct {
 	Materials map[string]*SecretRecord
 	Leases    map[string]*LeaseRecord
 	auditFile *os.File
+	// receiptKey signs usage receipts. Unlike the demo master key it is
+	// persisted, because receipts must stay verifiable after a restart; it
+	// never protects material plaintext.
+	receiptKey ed25519.PrivateKey
 }
 
 func OpenStore(ctx context.Context, dir string) (*Store, error) {
@@ -41,7 +51,57 @@ func OpenStore(ctx context.Context, dir string) (*Store, error) {
 	if err := store.openAudit(ctx); err != nil {
 		return nil, err
 	}
+	if err := store.loadReceiptKey(); err != nil {
+		return nil, err
+	}
 	return store, nil
+}
+
+// ReceiptPublicKey exposes the verification half of the receipt signing key
+// so receipts can be checked offline without the service.
+func (s *Store) ReceiptPublicKey() ed25519.PublicKey {
+	return s.receiptKey.Public().(ed25519.PublicKey)
+}
+
+// ReceiptKeyID identifies which signing key produced a receipt.
+func (s *Store) ReceiptKeyID() string {
+	sum := sha256.Sum256(s.ReceiptPublicKey())
+	return "rkey_" + hex.EncodeToString(sum[:12])
+}
+
+// SignReceipt signs the canonical receipt payload.
+func (s *Store) SignReceipt(payload []byte) []byte {
+	return ed25519.Sign(s.receiptKey, payload)
+}
+
+type receiptKeyFileData struct {
+	SeedB64 string `json:"seed_b64"`
+}
+
+func (s *Store) loadReceiptKey() error {
+	path := filepath.Join(s.dir, receiptKeyFile)
+	var data receiptKeyFileData
+	if err := readJSON(path, &data); err != nil {
+		return err
+	}
+	if data.SeedB64 != "" {
+		seed, err := base64.StdEncoding.DecodeString(data.SeedB64)
+		if err != nil {
+			return fmt.Errorf("load receipt signing key: %w", err)
+		}
+		if len(seed) != ed25519.SeedSize {
+			return fmt.Errorf("load receipt signing key: bad seed length %d", len(seed))
+		}
+		s.receiptKey = ed25519.NewKeyFromSeed(seed)
+		return nil
+	}
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	s.receiptKey = key
+	seed := key.Seed()
+	return writeJSONAtomic(path, receiptKeyFileData{SeedB64: base64.StdEncoding.EncodeToString(seed)}, 0o600)
 }
 
 func (s *Store) SaveSecret(ctx context.Context, record *SecretRecord) error {
