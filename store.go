@@ -18,11 +18,12 @@ const (
 )
 
 type Store struct {
-	dir       string
-	Materials map[string]*SecretRecord
-	Leases    map[string]*LeaseRecord
-	Facts     *AuthorizationFacts
-	auditFile *os.File
+	dir        string
+	Materials  map[string]*SecretRecord
+	Leases     map[string]*LeaseRecord
+	Facts      *AuthorizationFacts
+	UsageFacts map[string]*UsageFact
+	auditFile  *os.File
 }
 
 func OpenStore(ctx context.Context, dir string) (*Store, error) {
@@ -30,9 +31,10 @@ func OpenStore(ctx context.Context, dir string) (*Store, error) {
 		return nil, err
 	}
 	store := &Store{
-		dir:       dir,
-		Materials: make(map[string]*SecretRecord),
-		Leases:    make(map[string]*LeaseRecord),
+		dir:        dir,
+		Materials:  make(map[string]*SecretRecord),
+		Leases:     make(map[string]*LeaseRecord),
+		UsageFacts: make(map[string]*UsageFact),
 	}
 	if err := store.loadMaterials(); err != nil {
 		return nil, err
@@ -71,6 +73,27 @@ func (s *Store) SaveFacts(ctx context.Context, facts *AuthorizationFacts) error 
 	_ = ctx
 	s.Facts = cloneJSON(facts)
 	return writeJSONAtomic(filepath.Join(s.dir, factsFile), s.Facts, 0o600)
+}
+
+// AppendUsageFact records one use occurrence in memory. Occurrences are
+// immutable: an existing receipt ID can never be overwritten or rebound. The
+// facts file is rewritten atomically with the rest of the authorization facts
+// by the caller while holding the service lock.
+func (s *Store) AppendUsageFact(usage *UsageFact) error {
+	if usage == nil || usage.ReceiptID == "" {
+		return fmt.Errorf("%w: usage fact requires a receipt id", ErrInvalidArgument)
+	}
+	if s.UsageFacts == nil {
+		s.UsageFacts = make(map[string]*UsageFact)
+	}
+	if existing, ok := s.UsageFacts[usage.ReceiptID]; ok {
+		if existing.FactHash != usage.FactHash {
+			return fmt.Errorf("%w: usage occurrence %s already exists with different content", ErrInvalidArgument, usage.ReceiptID)
+		}
+		return nil
+	}
+	s.UsageFacts[usage.ReceiptID] = cloneJSON(usage)
+	return nil
 }
 
 func (s *Store) AppendAudit(ctx context.Context, event AuditEvent) {
@@ -154,7 +177,13 @@ func (s *Store) loadFacts() error {
 		s.Facts = &AuthorizationFacts{
 			Secrets: make(map[string]*SecretFact),
 			Leases:  make(map[string]*LeaseFact),
+			Usages:  make(map[string]*UsageFact),
 		}
+	}
+	if s.Facts.Usages != nil {
+		s.UsageFacts = s.Facts.Usages
+	} else if s.UsageFacts == nil {
+		s.UsageFacts = make(map[string]*UsageFact)
 	}
 	return nil
 }

@@ -73,6 +73,24 @@ func main() {
 	}
 	report("original receipt after rotation", localsecretmaterials.VerifyReceipt(receipt, facts, time.Now()))
 
+	// Rotated-version substitution: rewrite the receipt onto the new version
+	// with a recomputed hash. The recorded occurrence is not rewritten, so it
+	// is rejected rather than silently becoming a new-version use.
+	substituted := *receipt
+	for _, version := range facts.Secrets["reporting-token"].Versions {
+		if version.VersionID != receipt.VersionID {
+			substituted.VersionID = version.VersionID
+			substituted.MaterialDigest = version.MaterialDigest
+		}
+	}
+	report("rotated-version substitution", localsecretmaterials.VerifyReceipt(&substituted, facts, time.Now()))
+
+	// Partial disclosure: a verifier given facts with the occurrence withheld
+	// must remain undecided, not declare the use illegal or currently usable.
+	partial := *facts
+	partial.Usages = map[string]*localsecretmaterials.UsageFact{}
+	report("occurrence withheld from verifier", localsecretmaterials.VerifyReceipt(receipt, &partial, time.Now()))
+
 	// Tampered receipt: decision flipped, one delegation layer removed.
 	tampered := *receipt
 	tampered.Decision = "allowed-unconditionally"
@@ -95,5 +113,5 @@ func report(label string, result *localsecretmaterials.ReceiptVerification) {
 	if reason == "" {
 		reason = "ok"
 	}
-	fmt.Printf("%-38s valid_then=%-5v usable_now=%-5v (%s)\n", label+":", result.Valid, result.CurrentlyUsable, reason)
+	fmt.Printf("%-38s status=%-12s valid_then=%-5v usable_now=%-5v (%s)\n", label+":", result.Status, result.Valid, result.CurrentlyUsable, reason)
 }

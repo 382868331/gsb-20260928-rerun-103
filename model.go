@@ -29,8 +29,39 @@ type LeaseRecord struct {
 	AllowsNewVersions bool      `json:"allows_new_versions,omitempty"`
 	IssuedAt          time.Time `json:"issued_at"`
 	ExpiresAt         time.Time `json:"expires_at"`
-	RevokedAt         time.Time `json:"revoked_at,omitempty"`
-	SettleRule        string    `json:"settle_rule,omitempty"`
+	// GrantedExpiresAt is fixed at issuance; grace settling only shortens
+	// ExpiresAt. Zero on records created before receipts existed.
+	GrantedExpiresAt time.Time `json:"granted_expires_at,omitempty"`
+	RevokedAt        time.Time `json:"revoked_at,omitempty"`
+	SettleRule       string    `json:"settle_rule,omitempty"`
+	// PriorVersionIDs records versions this lease held before rotation-driven
+	// adoption, so an earlier receipt still binds to a version once held.
+	PriorVersionIDs []string `json:"prior_version_ids,omitempty"`
+	// PriorFactHashes retains the fact hashes of earlier lease states.
+	PriorFactHashes []string `json:"prior_fact_hashes,omitempty"`
+}
+
+// snapshotFactForHistory records the lease's current fact hash before a
+// version-adoption or expiry-settling change mutates it.
+func (r *LeaseRecord) snapshotFactForHistory() {
+	current := leaseFactFromRecord(r).FactHash
+	for _, prior := range r.PriorFactHashes {
+		if prior == current {
+			return
+		}
+	}
+	r.PriorFactHashes = append(r.PriorFactHashes, current)
+}
+
+// recordPriorVersion remembers a version the lease is leaving during
+// rotation-driven adoption.
+func (r *LeaseRecord) recordPriorVersion(versionID string) {
+	for _, prior := range r.PriorVersionIDs {
+		if prior == versionID {
+			return
+		}
+	}
+	r.PriorVersionIDs = append(r.PriorVersionIDs, versionID)
 }
 
 func (r *LeaseRecord) IsActive(now time.Time) bool {

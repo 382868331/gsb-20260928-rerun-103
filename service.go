@@ -328,6 +328,7 @@ func (s *Service) Borrow(ctx context.Context, name string, ttl time.Duration, op
 		AllowsNewVersions: spec.AllowsNewVersions,
 		IssuedAt:          now.UTC(),
 		ExpiresAt:         now.Add(ttl).UTC(),
+		GrantedExpiresAt:  now.Add(ttl).UTC(),
 	}
 	if err := s.store.SaveLease(ctx, lease); err != nil {
 		return nil, err
@@ -417,6 +418,7 @@ func (s *Service) Delegate(ctx context.Context, parentToken string, opts Delegat
 		AllowsNewVersions: opts.AllowsNewVersions,
 		IssuedAt:          now.UTC(),
 		ExpiresAt:         childExpiry,
+		GrantedExpiresAt:  childExpiry,
 	}
 	if err := s.store.SaveLease(ctx, child); err != nil {
 		return nil, err
@@ -721,7 +723,9 @@ func (s *Service) adoptCurrentVersionBatchLocked(ctx context.Context, record *Se
 			continue
 		}
 		previous := lease.VersionID
+		lease.snapshotFactForHistory()
 		lease.VersionID = record.CurrentVersionID
+		lease.recordPriorVersion(previous)
 		if err := s.store.SaveLease(ctx, lease); err != nil {
 			lease.VersionID = previous
 			return changed, err
@@ -835,6 +839,7 @@ func (s *Service) settleLeaseBatchLocked(ctx context.Context, name, versionID st
 		if lease == nil || !lease.IsActive(now) || !deadline.Before(lease.ExpiresAt) {
 			continue
 		}
+		lease.snapshotFactForHistory()
 		lease.ExpiresAt = deadline.UTC()
 		lease.SettleRule = "batch_settle"
 		if err := s.store.SaveLease(ctx, lease); err != nil {
