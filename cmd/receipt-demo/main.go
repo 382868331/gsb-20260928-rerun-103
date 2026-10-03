@@ -73,6 +73,38 @@ func main() {
 	}
 	report("original receipt after rotation", localsecretmaterials.VerifyReceipt(receipt, facts, time.Now()))
 
+	// Version-rewrite attack: retarget the old receipt at the rotated version
+	// and recompute every digest. It must be rejected as invalid because the
+	// registered usage event pins the version that was actually used.
+	var v2Digest string
+	for _, version := range facts.Secrets["reporting-token"].Versions {
+		if version.VersionID == material.VersionID {
+			continue
+		}
+		v2Digest = version.MaterialDigest
+	}
+	swapped := *receipt
+	for _, version := range facts.Secrets["reporting-token"].Versions {
+		if version.MaterialDigest == v2Digest {
+			swapped.VersionID = version.VersionID
+		}
+	}
+	swapped.MaterialDigest = v2Digest
+	swapped.ReceiptHash = localsecretmaterials.RecomputeReceiptHash(&swapped)
+	report("version-rewritten receipt", localsecretmaterials.VerifyReceipt(&swapped, facts, time.Now()))
+
+	// A different verifier holds only the minimum redacted facts: hashes and
+	// one usage event, no business purpose text, no unrelated authorizations.
+	redacted := localsecretmaterials.RedactFactsForReceipt(facts, receipt)
+	report("receipt on redacted facts only", localsecretmaterials.VerifyReceipt(receipt, redacted, time.Now()))
+
+	// No matching registered usage event: evidence is insufficient, so the
+	// answer is undetermined rather than illegal or currently usable.
+	unknown := *receipt
+	unknown.ID = "rcpt_00000000000000000000000000000000"
+	unknown.ReceiptHash = localsecretmaterials.RecomputeReceiptHash(&unknown)
+	report("receipt absent from held facts", localsecretmaterials.VerifyReceipt(&unknown, redacted, time.Now()))
+
 	// Tampered receipt: decision flipped, one delegation layer removed.
 	tampered := *receipt
 	tampered.Decision = "allowed-unconditionally"
@@ -95,5 +127,5 @@ func report(label string, result *localsecretmaterials.ReceiptVerification) {
 	if reason == "" {
 		reason = "ok"
 	}
-	fmt.Printf("%-38s valid_then=%-5v usable_now=%-5v (%s)\n", label+":", result.Valid, result.CurrentlyUsable, reason)
+	fmt.Printf("%-38s status=%-12s valid_then=%-5v usable_now=%-5v (%s)\n", label+":", result.Status, result.Valid, result.CurrentlyUsable, reason)
 }
