@@ -65,6 +65,97 @@ func TestUsageReceiptVersionSwapRejected(t *testing.T) {
 
 // Cross-receipt splicing: two receipts each legitimate on their own chain
 // must not combine into a wider authorization for a single use.
+// Hiding the optional business hint must never invalidate a legitimate
+// receipt: the hint is a redactable note, while the material version,
+// purpose commitment, decision, and delegation chain stay pinned.
+func TestUsageReceiptPurposeHintRedaction(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	_, child := setupReceiptChain(t, svc, &now)
+
+	_, receipt, err := svc.UseWithReceipt(ctx, child.Token, ReceiptOptions{PurposeHint: "billing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := svc.AuthorizationFactsSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Full disclosure verifies.
+	if result := VerifyReceipt(receipt, facts, now); result.Status != StatusValid || !result.CurrentlyUsable {
+		t.Fatalf("fully disclosed receipt must verify: %+v", result)
+	}
+	// A shortened hint still verifies.
+	shortened := *receipt
+	shortened.PurposeHint = "bill"
+	if result := VerifyReceipt(&shortened, facts, now); result.Status != StatusValid {
+		t.Fatalf("shortened hint must still verify: %+v", result)
+	}
+	// A cleared hint still verifies.
+	cleared := *receipt
+	cleared.PurposeHint = ""
+	if result := VerifyReceipt(&cleared, facts, now); result.Status != StatusValid {
+		t.Fatalf("cleared hint must still verify: %+v", result)
+	}
+	// Hiding the hint must not invalidate the receipt even after the chain
+	// becomes unusable; it only flips the current-usability marker.
+	later := now.Add(2 * time.Hour)
+	if result := VerifyReceipt(&cleared, facts, later); result.Status != StatusValid || result.CurrentlyUsable {
+		t.Fatalf("expired chain with hidden hint: %+v", result)
+	}
+
+	// A hint that is not a prefix of the registered hint is rejected, even
+	// though the receipt hash no longer covers the hint.
+	replaced := *receipt
+	replaced.PurposeHint = "marketing"
+	if result := VerifyReceipt(&replaced, facts, now); result.Status != StatusInvalid {
+		t.Fatalf("replaced hint accepted: %+v", result)
+	}
+	extended := *receipt
+	extended.PurposeHint = "billing/monthly-close"
+	if result := VerifyReceipt(&extended, facts, now); result.Status != StatusInvalid {
+		t.Fatalf("extended hint accepted: %+v", result)
+	}
+
+	// A hint spliced in from another legitimate receipt is rejected.
+	other, err := svc.Borrow(ctx, "vault-token", time.Hour, BorrowOptions{
+		Purpose: "ops", Scopes: []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherReceipt, err := svc.UseWithReceipt(ctx, other.Token, ReceiptOptions{PurposeHint: "ops"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err = svc.AuthorizationFactsSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spliced := *receipt
+	spliced.PurposeHint = otherReceipt.PurposeHint
+	if result := VerifyReceipt(&spliced, facts, now); result.Status != StatusInvalid {
+		t.Fatalf("cross-receipt hint splice accepted: %+v", result)
+	}
+
+	// Missing necessary facts stay undetermined, not invalid, even when the
+	// hint has been hidden.
+	depleted := cloneJSON(facts)
+	delete(depleted.Receipts, receipt.ID)
+	if result := VerifyReceipt(&cleared, depleted, now); result.Status != StatusUndetermined || result.Valid {
+		t.Fatalf("hidden hint with missing event must be undetermined: %+v", result)
+	}
+
+	// Verification output never carries material plaintext.
+	encoded, _ := json.Marshal(VerifyReceipt(receipt, facts, now))
+	if strings.Contains(string(encoded), "fictional-material-body") {
+		t.Fatalf("verification output leaks material: %s", encoded)
+	}
+}
+
 func TestUsageReceiptCrossReceiptSplicingRejected(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := testService(t)

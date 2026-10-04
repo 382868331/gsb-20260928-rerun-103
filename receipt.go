@@ -108,7 +108,10 @@ const (
 
 // UsageReceipt proves one specific use matched the complete delegation chain
 // at use time. It discloses hashes plus an optional purpose prefix only; the
-// full purpose and the material stay out of the receipt.
+// full purpose and the material stay out of the receipt. The purpose hint is
+// a redactable business note: the holder may clear or shorten it before
+// showing the receipt, and verification still succeeds as long as the
+// remaining hint is a prefix of the hint registered for this use.
 type UsageReceipt struct {
 	ID             string    `json:"id"`
 	SecretName     string    `json:"secret_name"`
@@ -242,11 +245,18 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 		receipt.VersionID != record.VersionID ||
 		receipt.MaterialDigest != record.MaterialDigest ||
 		receipt.Decision != record.Decision ||
-		receipt.PurposeHint != record.PurposeHint ||
 		len(record.LeaseIDs) == 0 || receipt.LeaseID != record.LeaseIDs[0] ||
 		!receipt.IssuedAt.Equal(record.IssuedAt) ||
 		len(receipt.Chain) != len(record.ChainLinks) {
 		return invalid("receipt does not match the registered usage event")
+	}
+	// The purpose hint is a redactable business note, not an immutable usage
+	// fact: the holder may clear it or shorten it after issuance. What stays
+	// pinned is that whatever hint is still shown must be a prefix of the
+	// hint the service registered for this exact use, so a hint cannot be
+	// replaced, extended, or spliced in from another receipt.
+	if !strings.HasPrefix(record.PurposeHint, receipt.PurposeHint) {
+		return invalid("disclosed purpose hint does not match the registered usage event")
 	}
 
 	// Rebuild the single delegation chain named by the registered event,
@@ -568,6 +578,11 @@ func chainLinkHash(factHashValue, parentLinkHash string) string {
 func recomputeReceiptHash(receipt *UsageReceipt) string {
 	clone := *receipt
 	clone.ReceiptHash = ""
+	// PurposeHint is a redactable business note, so it stays outside the
+	// self-consistency hash: clearing or shortening it must not invalidate
+	// an otherwise legitimate receipt. The registered usage event still
+	// pins which hint prefixes may be shown for this use.
+	clone.PurposeHint = ""
 	return hashCanonical("usage-receipt-v1", &clone)
 }
 
