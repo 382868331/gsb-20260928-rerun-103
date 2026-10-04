@@ -115,6 +115,142 @@ func TestUsageReceiptRejectsBadHintAndTampering(t *testing.T) {
 	}
 }
 
+func TestUsageReceiptHintRedactionKeepsValidity(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	_, child := setupReceiptChain(t, svc, &now)
+
+	_, receipt, err := svc.UseWithReceipt(ctx, child.Token, ReceiptOptions{PurposeHint: "billing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := svc.AuthorizationFactsSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Full disclosure verifies.
+	if result := VerifyReceipt(receipt, facts, now); !result.Valid {
+		t.Fatalf("full hint verification = %+v", result)
+	}
+	// Shortening the business hint to any prefix keeps the receipt valid.
+	shortened := *receipt
+	shortened.PurposeHint = "bill"
+	if result := VerifyReceipt(&shortened, facts, now); !result.Valid {
+		t.Fatalf("shortened hint verification = %+v", result)
+	}
+	// Clearing the hint entirely keeps the receipt valid.
+	cleared := *receipt
+	cleared.PurposeHint = ""
+	if result := VerifyReceipt(&cleared, facts, now); !result.Valid {
+		t.Fatalf("cleared hint verification = %+v", result)
+	}
+	// Redaction also verifies against the minimal redacted fact subset.
+	redacted := RedactFactsForReceipt(facts, receipt)
+	if result := VerifyReceipt(&cleared, redacted, now); !result.Valid {
+		t.Fatalf("cleared hint with redacted facts = %+v", result)
+	}
+	// A hint that is not a prefix of the registered hint is not redaction.
+	forged := *receipt
+	forged.PurposeHint = "bills"
+	if result := VerifyReceipt(&forged, facts, now); result.Valid || result.Status != StatusInvalid {
+		t.Fatalf("forged hint verification = %+v", result)
+	}
+	// Verification output never carries material plaintext.
+	encoded, _ := json.Marshal(VerifyReceipt(receipt, facts, now))
+	if strings.Contains(string(encoded), "fictional-material-body") {
+		t.Fatalf("verification output leaks material: %s", encoded)
+	}
+}
+
+func TestUsageReceiptCrossReceiptHintSplicing(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	if _, err := svc.CreateSecret(ctx, "vault-token", []byte("fictional-material-body"), SecretOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	rootA, err := svc.Borrow(ctx, "vault-token", time.Hour, BorrowOptions{
+		Purpose: "billing", Scopes: []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootB, err := svc.Borrow(ctx, "vault-token", time.Hour, BorrowOptions{
+		Purpose: "audit", Scopes: []Scope{ScopeReadMaterial},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, receiptA, err := svc.UseWithReceipt(ctx, rootA.Token, ReceiptOptions{PurposeHint: "billing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, receiptB, err := svc.UseWithReceipt(ctx, rootB.Token, ReceiptOptions{PurposeHint: "audit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := svc.AuthorizationFactsSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Splicing receipt B's hint into receipt A is not a redaction of A's
+	// registered hint and must be rejected.
+	spliced := *receiptA
+	spliced.PurposeHint = "audit"
+	if result := VerifyReceipt(&spliced, facts, now); result.Valid || result.Status != StatusInvalid {
+		t.Fatalf("cross-receipt hint splice = %+v", result)
+	}
+	// Splicing receipt B's chain into receipt A stays invalid too.
+	splicedChain := *receiptA
+	splicedChain.Chain = receiptB.Chain
+	if result := VerifyReceipt(&splicedChain, facts, now); result.Valid || result.Status != StatusInvalid {
+		t.Fatalf("cross-receipt chain splice = %+v", result)
+	}
+}
+
+func TestUsageReceiptMissingFactsUndetermined(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := testService(t)
+	now := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	setClock(svc, &now)
+	_, child := setupReceiptChain(t, svc, &now)
+
+	_, receipt, err := svc.UseWithReceipt(ctx, child.Token, ReceiptOptions{PurposeHint: "billing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := svc.AuthorizationFactsSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// No registered usage event: undetermined, never valid.
+	withoutRecord := cloneJSON(facts)
+	delete(withoutRecord.Receipts, receipt.ID)
+	if result := VerifyReceipt(receipt, withoutRecord, now); result.Valid || result.Status != StatusUndetermined {
+		t.Fatalf("missing usage record = %+v", result)
+	}
+	// A missing delegation layer: undetermined.
+	withoutLease := cloneJSON(facts)
+	for id := range withoutLease.Leases {
+		delete(withoutLease.Leases, id)
+		break
+	}
+	if result := VerifyReceipt(receipt, withoutLease, now); result.Valid || result.Status != StatusUndetermined {
+		t.Fatalf("missing delegation layer = %+v", result)
+	}
+	// A missing version fact: undetermined.
+	withoutVersion := cloneJSON(facts)
+	withoutVersion.Secrets[receipt.SecretName].Versions = nil
+	if result := VerifyReceipt(receipt, withoutVersion, now); result.Valid || result.Status != StatusUndetermined {
+		t.Fatalf("missing version fact = %+v", result)
+	}
+}
+
 func TestUsageReceiptParallelChainsCannotMerge(t *testing.T) {
 	ctx := context.Background()
 	svc, _ := testService(t)

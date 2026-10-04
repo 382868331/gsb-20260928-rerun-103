@@ -26,6 +26,10 @@ type ReceiptOptions struct {
 	// The full purpose only ever appears as a hash inside the receipt, so a
 	// borrower can redact the business description down to any prefix. A hint
 	// that is not a prefix of the real purpose is rejected at issuance.
+	// The hint is business annotation, not a usage fact: the receipt hash
+	// commits to the hint registered at issuance, and a holder may later
+	// present the receipt with the hint shortened or cleared without
+	// invalidating it.
 	PurposeHint string
 }
 
@@ -54,14 +58,17 @@ type LeaseFact struct {
 // matching record among the verifier's held facts, the use cannot be
 // confirmed and verification stays undetermined rather than valid.
 type ReceiptRecord struct {
-	ReceiptID      string   `json:"receipt_id"`
-	SecretName     string   `json:"secret_name"`
-	VersionID      string   `json:"version_id"`
-	MaterialDigest string   `json:"material_digest"`
-	Decision       string   `json:"decision"`
-	PurposeHint    string   `json:"purpose_hint,omitempty"`
-	LeaseIDs       []string `json:"lease_ids"`
-	ChainLinks     []string `json:"chain_links"`
+	ReceiptID      string `json:"receipt_id"`
+	SecretName     string `json:"secret_name"`
+	VersionID      string `json:"version_id"`
+	MaterialDigest string `json:"material_digest"`
+	Decision       string `json:"decision"`
+	// PurposeHint is the business hint registered at issuance. It is not an
+	// immutable usage fact: a presented receipt may carry any prefix of it
+	// (including empty), and verification canonicalizes back to this value.
+	PurposeHint string   `json:"purpose_hint,omitempty"`
+	LeaseIDs    []string `json:"lease_ids"`
+	ChainLinks  []string `json:"chain_links"`
 	// PurposeWitnesses[i] vouches, without disclosing any business text, that
 	// chain[i-1].Purpose lies within chain[i].Purpose. The service checked the
 	// containment at delegation time; a verifier holding hash-only purposes
@@ -228,9 +235,6 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	if receipt.Decision != "allowed" {
 		return invalid("receipt decision is not allowed")
 	}
-	if recomputeReceiptHash(receipt) != receipt.ReceiptHash {
-		return invalid("receipt hash mismatch")
-	}
 
 	// A receipt is only a claim. The claim is accepted only when the held
 	// facts contain the service-registered record of exactly this use.
@@ -238,11 +242,24 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	if record == nil {
 		return undetermined("no registered usage event matches this receipt")
 	}
+	// The receipt hash commits to the hint registered at issuance. The
+	// presented receipt may hide that business hint (shorten it to any
+	// prefix, or clear it entirely); the immutable usage facts - object,
+	// version, decision, delegation chain - may not change. Verify the hash
+	// against the registered hint so redacted receipts still check out and
+	// hints spliced from other receipts do not.
+	if receipt.PurposeHint != "" && !strings.HasPrefix(record.PurposeHint, receipt.PurposeHint) {
+		return invalid("disclosed purpose hint is not a redaction of the registered hint")
+	}
+	canonical := *receipt
+	canonical.PurposeHint = record.PurposeHint
+	if recomputeReceiptHash(&canonical) != receipt.ReceiptHash {
+		return invalid("receipt hash mismatch")
+	}
 	if receipt.SecretName != record.SecretName ||
 		receipt.VersionID != record.VersionID ||
 		receipt.MaterialDigest != record.MaterialDigest ||
 		receipt.Decision != record.Decision ||
-		receipt.PurposeHint != record.PurposeHint ||
 		len(record.LeaseIDs) == 0 || receipt.LeaseID != record.LeaseIDs[0] ||
 		!receipt.IssuedAt.Equal(record.IssuedAt) ||
 		len(receipt.Chain) != len(record.ChainLinks) {
@@ -576,6 +593,9 @@ func recomputeReceiptHash(receipt *UsageReceipt) string {
 // hash when inspecting or testing tampered receipts; it never makes an
 // internally-consistent receipt valid on its own, since validity additionally
 // requires the registered usage event among the verifier's facts.
+// The hash commits to the purpose hint registered at issuance, so when a
+// receipt is presented with the hint shortened or cleared, recompute over a
+// copy whose PurposeHint is restored from the registered usage event.
 func RecomputeReceiptHash(receipt *UsageReceipt) string {
 	return recomputeReceiptHash(receipt)
 }
