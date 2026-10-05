@@ -214,11 +214,91 @@ func (s *Service) AuthorizationFactsSnapshot(ctx context.Context) (*Authorizatio
 	return cloneJSON(s.store.Facts), nil
 }
 
+// factTracker records which authorization facts a verification run relied on
+// and which necessary facts were absent, so a verification task can report
+// the exact basis of every decision and what is still missing.
+type factTracker struct {
+	used    map[string]bool
+	missing []string
+}
+
+func newFactTracker() *factTracker {
+	return &factTracker{used: make(map[string]bool)}
+}
+
+// factView reads authorization facts while optionally recording access.
+type factView struct {
+	facts *AuthorizationFacts
+	track *factTracker
+}
+
+func (v *factView) record(id string) *ReceiptRecord {
+	if v.facts == nil {
+		return nil
+	}
+	record := v.facts.Receipts[id]
+	if v.track != nil {
+		if record == nil {
+			v.track.missing = append(v.track.missing, "registered usage event "+id)
+		} else {
+			v.track.used["receipt/"+id] = true
+		}
+	}
+	return record
+}
+
+func (v *factView) lease(id string) *LeaseFact {
+	if v.facts == nil {
+		return nil
+	}
+	fact := v.facts.Leases[id]
+	if v.track != nil {
+		if fact == nil {
+			v.track.missing = append(v.track.missing, "delegation layer "+id)
+		} else {
+			v.track.used["lease/"+id] = true
+		}
+	}
+	return fact
+}
+
+func (v *factView) secret(name string) *SecretFact {
+	if v.facts == nil {
+		return nil
+	}
+	secret := v.facts.Secrets[name]
+	if v.track != nil {
+		if secret == nil {
+			v.track.missing = append(v.track.missing, "secret "+name)
+		} else {
+			v.track.used["secret/"+name] = true
+		}
+	}
+	return secret
+}
+
+func (v *factView) missingVersion(secretName, versionID string) {
+	if v.track != nil {
+		v.track.missing = append(v.track.missing, "version "+versionID+" of secret "+secretName)
+	}
+}
+
 // VerifyReceipt checks a receipt against persisted authorization facts. It is
 // a pure function: it needs no service, no master key, and no network, and it
 // never sees material plaintext. Any removed delegation layer, substituted
 // object, or merged cross-chain permission makes Valid false.
 func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Time) *ReceiptVerification {
+	verification, _ := verifyReceiptTracked(receipt, facts, now, nil)
+	return verification
+}
+
+// verifyReceiptTracked is VerifyReceipt plus optional fact-access tracking,
+// used by verification tasks to record the basis of each decision.
+func verifyReceiptTracked(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Time, tracker *factTracker) (*ReceiptVerification, *factTracker) {
+	if tracker == nil {
+		tracker = newFactTracker()
+	}
+	view := &factView{facts: facts, track: tracker}
 	undetermined := func(reason string) *ReceiptVerification {
 		return &ReceiptVerification{Status: StatusUndetermined, Reason: reason}
 	}
@@ -226,20 +306,20 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 		return &ReceiptVerification{Status: StatusInvalid, Valid: false, Reason: reason}
 	}
 	if receipt == nil || facts == nil {
-		return undetermined("missing receipt or facts")
+		return undetermined("missing receipt or facts"), tracker
 	}
 	if receipt.Decision != "allowed" {
-		return invalid("receipt decision is not allowed")
+		return invalid("receipt decision is not allowed"), tracker
 	}
 	if recomputeReceiptHash(receipt) != receipt.ReceiptHash {
-		return invalid("receipt hash mismatch")
+		return invalid("receipt hash mismatch"), tracker
 	}
 
 	// A receipt is only a claim. The claim is accepted only when the held
 	// facts contain the service-registered record of exactly this use.
-	record := facts.Receipts[receipt.ID]
+	record := view.record(receipt.ID)
 	if record == nil {
-		return undetermined("no registered usage event matches this receipt")
+		return undetermined("no registered usage event matches this receipt"), tracker
 	}
 	if receipt.SecretName != record.SecretName ||
 		receipt.VersionID != record.VersionID ||
@@ -248,7 +328,7 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 		len(record.LeaseIDs) == 0 || receipt.LeaseID != record.LeaseIDs[0] ||
 		!receipt.IssuedAt.Equal(record.IssuedAt) ||
 		len(receipt.Chain) != len(record.ChainLinks) {
-		return invalid("receipt does not match the registered usage event")
+		return invalid("receipt does not match the registered usage event"), tracker
 	}
 	// The purpose hint is a redactable business note, not an immutable usage
 	// fact: the holder may clear it or shorten it after issuance. What stays
@@ -256,30 +336,30 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	// hint the service registered for this exact use, so a hint cannot be
 	// replaced, extended, or spliced in from another receipt.
 	if !strings.HasPrefix(record.PurposeHint, receipt.PurposeHint) {
-		return invalid("disclosed purpose hint does not match the registered usage event")
+		return invalid("disclosed purpose hint does not match the registered usage event"), tracker
 	}
 
 	// Rebuild the single delegation chain named by the registered event,
 	// leaf to root. Permissions from parallel chains cannot be merged in.
 	var chain []*LeaseFact
 	for i, id := range record.LeaseIDs {
-		fact := facts.Leases[id]
+		fact := view.lease(id)
 		if fact == nil {
-			return undetermined("a required delegation layer is absent from the held facts")
+			return undetermined("a required delegation layer is absent from the held facts"), tracker
 		}
 		if fact.SecretName != record.SecretName {
-			return invalid("delegation layer belongs to a different secret")
+			return invalid("delegation layer belongs to a different secret"), tracker
 		}
 		if i < len(record.LeaseIDs)-1 && fact.ParentID != record.LeaseIDs[i+1] {
-			return invalid("delegation chain has been spliced with another lease")
+			return invalid("delegation chain has been spliced with another lease"), tracker
 		}
 		if i == len(record.LeaseIDs)-1 && fact.ParentID != "" {
-			return invalid("delegation chain stops before its root lease")
+			return invalid("delegation chain stops before its root lease"), tracker
 		}
 		chain = append(chain, fact)
 	}
 	if len(chain) == 0 {
-		return invalid("registered usage event carries no delegation chain")
+		return invalid("registered usage event carries no delegation chain"), tracker
 	}
 
 	// The link hashes pin the immutable authorization granted at issuance
@@ -290,7 +370,7 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	for i := len(chain) - 1; i >= 0; i-- {
 		link := chainLinkHash(chain[i].FactHash, parentLink)
 		if link != record.ChainLinks[i] || link != receipt.Chain[i] {
-			return invalid("delegation chain link mismatch")
+			return invalid("delegation chain link mismatch"), tracker
 		}
 		parentLink = link
 	}
@@ -298,9 +378,9 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	// Confirm the used object: the version must be a real version of the
 	// named secret with the claimed digest, and must be the version this
 	// exact chain was authorized for at use time.
-	secret := facts.Secrets[record.SecretName]
+	secret := view.secret(record.SecretName)
 	if secret == nil {
-		return undetermined("the used secret is absent from the held facts")
+		return undetermined("the used secret is absent from the held facts"), tracker
 	}
 	var versionFact *VersionFact
 	for i := range secret.Versions {
@@ -310,10 +390,11 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 		}
 	}
 	if versionFact == nil {
-		return undetermined("the used version is absent from the held facts")
+		view.missingVersion(record.SecretName, record.VersionID)
+		return undetermined("the used version is absent from the held facts"), tracker
 	}
 	if versionFact.MaterialDigest != record.MaterialDigest {
-		return invalid("material digest does not match the registered version")
+		return invalid("material digest does not match the registered version"), tracker
 	}
 	allAdoptNew := true
 	for _, fact := range chain {
@@ -325,23 +406,23 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 		// A pinned chain authorizes exactly the leaf's pinned version, not
 		// any later rotated version with an otherwise valid digest.
 		if chain[0].VersionID != record.VersionID {
-			return invalid("receipt version was not authorized by the pinned lease")
+			return invalid("receipt version was not authorized by the pinned lease"), tracker
 		}
 	}
 
 	leaf := chain[0]
 	if factHash(leaf) != leaf.FactHash {
-		return invalid("leaf lease fact hash does not match its contents")
+		return invalid("leaf lease fact hash does not match its contents"), tracker
 	}
 	if !factHasScope(leaf, ScopeReadMaterial) {
-		return invalid("leaf lease lacks material read scope")
+		return invalid("leaf lease lacks material read scope"), tracker
 	}
 	if receipt.PurposeHint != "" {
 		if leaf.Purpose == "" {
 			// Hash-only facts disclose no business text; the registered event
 			// already pins the hint, and issuance guaranteed it was a prefix.
 		} else if !strings.HasPrefix(leaf.Purpose, receipt.PurposeHint) {
-			return invalid("disclosed purpose hint does not match the lease purpose")
+			return invalid("disclosed purpose hint does not match the lease purpose"), tracker
 		}
 	}
 	// Containment checks only run where the held facts disclose the fields.
@@ -349,31 +430,31 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 	for i := 1; i < len(chain); i++ {
 		child, parent := chain[i-1], chain[i]
 		if factHash(child) != child.FactHash || factHash(parent) != parent.FactHash {
-			return invalid("delegation fact hash does not match its contents")
+			return invalid("delegation fact hash does not match its contents"), tracker
 		}
 		if child.Purpose != "" && parent.Purpose != "" && !purposeWithin(parent.Purpose, child.Purpose) {
-			return invalid("delegated purpose escapes upstream purpose")
+			return invalid("delegated purpose escapes upstream purpose"), tracker
 		}
 		if child.Purpose == "" || parent.Purpose == "" {
 			witnessIndex := i - 1
 			if witnessIndex >= len(record.PurposeWitnesses) ||
 				purposeWitnessHash(parent.PurposeHash, child.PurposeHash) != record.PurposeWitnesses[witnessIndex] {
-				return undetermined("held facts cannot confirm the delegated purpose stays within upstream purpose")
+				return undetermined("held facts cannot confirm the delegated purpose stays within upstream purpose"), tracker
 			}
 		}
 		if !scopesWithin(scopeStrings(child.Scopes), parent.Scopes) {
-			return invalid("delegated scope escapes upstream scope")
+			return invalid("delegated scope escapes upstream scope"), tracker
 		}
 		if child.ExpiresAt.After(parent.ExpiresAt) {
-			return invalid("delegated expiry escapes upstream expiry")
+			return invalid("delegated expiry escapes upstream expiry"), tracker
 		}
 	}
 	for _, fact := range chain {
 		if record.IssuedAt.Before(fact.IssuedAt) {
-			return invalid("receipt predates a delegation layer it depends on")
+			return invalid("receipt predates a delegation layer it depends on"), tracker
 		}
 		if !record.IssuedAt.Before(fact.ExpiresAt) {
-			return invalid("receipt was issued while a chain layer was already expired")
+			return invalid("receipt was issued while a chain layer was already expired"), tracker
 		}
 	}
 
@@ -388,10 +469,10 @@ func VerifyReceipt(receipt *UsageReceipt, facts *AuthorizationFacts, now time.Ti
 			verification.Reason = "upstream or leaf lease has since expired"
 		}
 		if !verification.CurrentlyUsable {
-			return verification
+			return verification, tracker
 		}
 	}
-	return verification
+	return verification, tracker
 }
 
 // RedactFactsForReceipt returns a minimal, verifier-safe subset of facts that

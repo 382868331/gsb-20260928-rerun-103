@@ -24,6 +24,8 @@
 - 核对结果区分"当时合法"（`Valid`/`status=valid`）与"现在仍可用"（`CurrentlyUsable`）：事后上游撤销或到期不会让旧回执失效，但会标记当前不可用。
 - 回执中的 `PurposeHint` 是可隐藏的业务说明而非使用事实：持证人可在出示前清空或缩短它，离线核验仍判 `valid`；但提示只能是签发时登记提示的前缀，替换、扩写或从其他回执拼接提示都会被判 `invalid`。材料版本、用途承诺（哈希）、最终决定与委托链始终钉死，不随提示隐藏而改变。
 - 授权事实随借用、委托、轮换、撤销和回执签发自动持久化，重开进程后回执依赖的事实仍可追溯；事实文件只存密文摘要，不写材料正文。
+- `VerificationTask` 是可保存的离线核验任务：一次登记多份历史回执，逐批补交授权事实与发生记录（可乱序、可不完整）。每次核验为每份回执追加一条只增不改的决定，记录结论、所依据的事实批次（`BasisBatches`）与仍缺少的材料（`Missing`）；补充材料只产生新决定，先前的无法确定或拒绝结论保留在历史中不被改写。同一回执重复到达只计一次使用，同一材料版本的不同回执分别计数；事实批次相互矛盾时，受影响回执标为 `conflict` 并列出冲突依据批次，其他回执继续核验。任务可 `Save`/`LoadVerificationTask` 持久化，重开后继续核验。
+- `Export` 生成只含所需事实的离线核验包（`VerificationPackage`）：用途仅以哈希出现，不含无关授权与材料正文；接收者用 `Reproduce` 即可复现选定决定，导出本身不改变原任务。
 
 ## 主密钥边界
 
@@ -53,4 +55,10 @@ go run ./cmd/demo -dir /tmp/local-materials-demo
 
 ```bash
 go run ./cmd/receipt-demo -dir /tmp/local-materials-receipt-demo
+```
+
+核验任务演示（乱序补交、提示隐藏、事后撤销、任务重开与导出复现）：
+
+```bash
+go run ./cmd/verify-task-demo -dir /tmp/local-materials-verify-task-demo
 ```
